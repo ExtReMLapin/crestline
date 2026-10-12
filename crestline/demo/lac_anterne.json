@@ -1,0 +1,10 @@
+{
+ "description": "Lac d'Anterne (Haute-Savoie), Tour des Fiz. Photo de l'auteur, EXIF d'origine (focale lue automatiquement).",
+ "hfov_deg": 69.32,
+ "expected": {
+  "lat": 45.98843,
+  "lon": 6.80002,
+  "tolerance_m": 1000
+ },
+ "license": "CC BY 4.0"
+}

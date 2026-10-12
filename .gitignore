@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Projet
+data/
+outputs/
+node_modules/
+
+# Photos personnelles et rendus qui en contiennent : jamais sur GitHub
+photos/
+apercu_entrainement/
+
+# Poids publiés sur Hugging Face (LPN64/crestline-convnext-base), pas dans le dépôt
+hf_release/
+*.pt
+*.safetensors
+*.npy
+*.npz
+
+# Notes de travail internes (IP, machines) : jamais sur GitHub
+docs/HANDOFF.md
+RAPPORT_NUIT.md
