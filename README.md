@@ -1,53 +1,54 @@
 # Crestline
 
-*S.D.E.C.E. : Système de Détection de l'Emplacement par Comparaison des Escarpements — nom pris au hasard.*
+*In French: S.D.E.C.E. : Système de Détection de l'Emplacement par Comparaison des Escarpements — nom pris au hasard.*
 
-**Retrouver d'où une photo de montagne a été prise, sans GPS, à partir de sa ligne d'horizon.**
+**Find where a mountain photo was taken, without GPS, from its skyline.**
 
-![Lac d'Anterne : skyline de la photo (vert) et skyline calculée depuis le relief au point trouvé (cyan)](docs/images/demo_anterne.jpg)
+[Version française](README_FR.md)
 
-*Photo du lac d'Anterne (Haute-Savoie). Elle est retrouvée à sa position et à son cap (343°) parmi 230 000
-points de vue. En cyan, la ligne d'horizon calculée depuis le relief au point trouvé.*
+![Lac d'Anterne: photo skyline (green) and skyline rendered from the terrain at the found location (cyan)](docs/images/demo_anterne.jpg)
 
-## L'histoire
+*Photo of Lac d'Anterne (French Alps). Crestline finds its position and heading (343°) among 230,000 candidate
+viewpoints. In cyan: the skyline rendered from the terrain model at the found location.*
 
-J'ai ce projet en tête depuis 2021 : la ligne des crêtes contre le ciel est une empreinte, et vue d'un endroit
-donné elle est unique. En la comparant à toutes les lignes d'horizon calculées depuis un modèle de terrain, on
-doit pouvoir retrouver d'où une photo a été prise.
+## The story
 
-Je ne m'y suis jamais mis, faute de temps : entre l'état de l'art, la fabrication d'un jeu d'entraînement, un
-réseau de neurones, un moteur de rendu de relief sur GPU et un moteur de recherche, ça représentait des mois de
-travail pour un projet perso, donc ça n'en valait pas la peine.
+I have had this project in mind since 2021. The line of the ridges against the sky is a fingerprint: seen from a
+given spot, it is unique. Compare it with the skylines computed from a terrain model everywhere, and you should be
+able to tell where a photo was taken.
 
-En 2026, je l'ai fait avec [Claude Code](https://claude.com/claude-code) en quelques jours :
+I never got around to it. A literature review, a training set, a neural network, a GPU terrain renderer and a
+search engine add up to months of work for a side project. It was not worth it.
 
-- la recherche bibliographique ;
-- la fabrication d'annotations à partir de photos recalées par des bénévoles ;
-- l'entraînement et la publication du modèle ;
-- la base d'horizons de toute la Suisse ;
-- l'index de recherche ;
-- les évaluations ;
-- ce paquet.
+In 2026 I built it with [Claude Code](https://claude.com/claude-code) in a few days:
 
-Ce qui n'était pas rentable à développer l'est devenu.
+- the literature review;
+- labels generated from photos that volunteers had aligned on a 3D model;
+- training and publishing the model;
+- a skyline database covering all of Switzerland;
+- the search index;
+- the evaluations;
+- this package.
 
-## Essayer tout de suite
+What was not worth building became worth it.
+
+## Try it now
 
 ```bash
 pip install git+https://github.com/ExtReMLapin/crestline
 crestline demo
 ```
 
-La démo prend quelques minutes sur un GPU NVIDIA :
+The demo takes a few minutes on an NVIDIA GPU:
 
-1. elle télécharge une partie du relief suisse (quelques centaines de Mo) ;
-2. elle construit une carte de 60 × 60 km autour du Mont-Blanc ;
-3. elle retrouve la photo du lac d'Anterne.
+1. it downloads part of the Swiss terrain model (a few hundred MB);
+2. it builds a 60 × 60 km map around Mont Blanc;
+3. it finds where the Lac d'Anterne photo was taken.
 
-Installez d'abord le [torch adapté à votre carte](https://pytorch.org/get-started/locally/) ; les RTX 50xx
-demandent CUDA ≥ 12.8.
+Install the [right torch build for your GPU](https://pytorch.org/get-started/locally/) first; RTX 50xx cards
+need CUDA ≥ 12.8. The command-line messages are in French for now.
 
-### Une photo trouvée sur Internet, en une commande (Cervin, Suisse)
+### A photo from the web, in one command (Matterhorn, Switzerland)
 
 ```bash
 crestline locate https://upload.wikimedia.org/wikipedia/commons/b/bd/Weissgrat_from_Gornergrat_2021_04.jpg --near "Gornergrat" --radius 10
@@ -65,156 +66,156 @@ Weissgrat_from_Gornergrat_2021_04.jpg : 45.98347, 7.78520  cap 97°  score 0.106
   écart avec le GPS de l'EXIF : 19 m
 ```
 
-Voici ce qui se passe, en ~1 min la première fois et en quelques secondes ensuite :
+Here is what happens, in about 1 minute the first time and a few seconds after that:
 
-1. `--near` situe la zone grâce à OpenStreetMap.
-2. Le relief le plus précis disponible est choisi automatiquement : IGN en France, swisstopo en Suisse.
-3. La carte est construite, puis gardée en cache.
-4. La focale est lue dans l'EXIF de l'image.
+1. `--near` finds the area through OpenStreetMap.
+2. The most accurate terrain model available is picked automatically: IGN in France, swisstopo in Switzerland.
+3. The map is built, then cached.
+4. The focal length is read from the image EXIF.
 
-Le GPS de la photo sert seulement à afficher l'écart à la fin. Photo : Wikimedia Commons, CC BY-SA 4.0.
+The result lands **19 m** from the photo's GPS position. Crestline does not use that position: it only reports the
+error at the end. Photo: Wikimedia Commons, CC BY-SA 4.0.
 
-### Construire une carte une fois, pour beaucoup de photos
-
-```bash
-crestline map build cartes/zermatt --near "Zermatt" --radius 12 --index
-crestline map build cartes/anterne --source ign --bbox 6.70,45.93,6.90,46.05 --index
-crestline locate https://raw.githubusercontent.com/ExtReMLapin/crestline/main/crestline/demo/lac_anterne.jpg --map cartes/anterne
-```
-
-Le RGE ALTI (IGN, lidar, 5 m) est téléchargé tuile par tuile depuis la Géoplateforme. Un téléchargement
-interrompu reprend là où il s'était arrêté.
-
-- **Estimation avant de lancer** : avant tout gros travail, l'outil affiche le volume à télécharger, l'espace disque, la mémoire GPU et le temps estimés, puis demande confirmation (`--yes` pour ne pas la demander).
-- **Longitude négative** (Pyrénées, ouest de la France) : écrivez `--bbox=-0.30,42.62,0.02,42.86`, sinon le `-` est pris pour une option.
-
-### Vos photos
+### Build a map once, use it for many photos
 
 ```bash
-crestline locate photo.jpg --map cartes/anterne
-crestline locate mes_photos/ --map cartes/anterne --out resultats/
-crestline locate https://exemple.org/photo.jpg --map cartes/anterne --fov 65   # focale absente de l'EXIF
+crestline map build maps/zermatt --near "Zermatt" --radius 12 --index
+crestline map build maps/anterne --source ign --bbox 6.70,45.93,6.90,46.05 --index
+crestline locate https://raw.githubusercontent.com/ExtReMLapin/crestline/main/crestline/demo/lac_anterne.jpg --map maps/anterne
 ```
 
-## Sources de relief
+The IGN terrain model (RGE ALTI, lidar, 5 m) is downloaded tile by tile from the French Géoplateforme. An
+interrupted download resumes where it stopped.
 
-**La précision du relief compte plus que tout le reste.** Une erreur de 30 m sur une arête située à 1 km fait
-~1,7°, alors que la comparaison travaille à ~0,15° près.
+- **Estimate before running**: before any large job, Crestline shows the estimated download size, disk space, GPU memory and time, then asks for confirmation (`--yes` skips it).
+- **Negative longitudes** (Pyrenees, western France): write `--bbox=-0.30,42.62,0.02,42.86`, otherwise the `-` is read as an option.
 
-`--source auto` (par défaut avec `--near`) choisit pour vous.
+### Your photos
 
-| `--source` | Couverture | Précision | Licence | Conseil |
+```bash
+crestline locate photo.jpg --map maps/anterne
+crestline locate my_photos/ --map maps/anterne --out results/
+crestline locate https://example.org/photo.jpg --map maps/anterne --fov 65   # no focal length in EXIF
+```
+
+## Terrain sources
+
+**Terrain accuracy matters more than anything else.** A 30 m error on a ridge 1 km away shifts it by ~1.7°, while
+the matching works at ~0.15°.
+
+`--source auto` (the default with `--near`) picks one for you.
+
+| `--source` | Coverage | Accuracy | Licence | Advice |
 |---|---|---|---|---|
-| `ign` | France | lidar, 5 m (1 m disponible) | Licence Ouverte Etalab 2.0 | **recommandé en France** |
-| `swisstopo` | Suisse + ~100 km autour | 10 m (2 m en Suisse) | libre, « © swisstopo » | **recommandé en Suisse** |
-| `copernicus` | monde | radar, 30 m | libre (ESA) | dépannage : ~68 % de réussite au lieu de 88 % |
+| `ign` | France | lidar, 5 m (1 m available) | Licence Ouverte Etalab 2.0 | **best in France** |
+| `swisstopo` | Switzerland + ~100 km around | 10 m (2 m in Switzerland) | free, "© swisstopo" | **best in Switzerland** |
+| `copernicus` | worldwide | radar, 30 m | free (ESA) | fallback: ~68 % success instead of 88 % |
 
-- **Ce qui est téléchargé** : la zone des points de vue + 30 km à la maille fine (relief proche), et la zone + 120 km à 80 m (horizon lointain).
-- **Les trous** sont comblés par la source suivante (`ign` → `swisstopo` → `copernicus`), et la provenance est notée dans la carte.
-- **Réseau poli** : chaque installation s'identifie auprès des services avec un identifiant aléatoire (`~/.config/crestline/install_id`, sans rien révéler de la machine). Le géocodage respecte la règle d'OpenStreetMap (1 requête par seconde) et ses résultats sont gardés en cache.
-- **Rien n'est fait deux fois.** Relancer la même commande réutilise le relief déjà téléchargé, les horizons et l'index (même source, même maille, zone contenue dans la précédente). Si un réglage change (pas, hauteur, zone), seule la carte est recalculée. `--force` refait tout.
-- **Pour juste récupérer le relief** : `crestline dem fetch --source ign --bbox … --out dossier/`.
-- **Votre propre MNT** (GeoTIFF, n'importe quel système de coordonnées) : `--dem mon_mnt.tif` au lieu de `--source`.
+- **What gets downloaded**: the viewpoint area + 30 km at the fine cell size (nearby terrain), and the area + 120 km at 80 m (distant horizon).
+- **Gaps** are filled by the next source (`ign` → `swisstopo` → `copernicus`), and the provenance is recorded in the map.
+- **Polite networking**: each installation identifies itself to the services with a random ID (`~/.config/crestline/install_id`, which reveals nothing about the machine). Geocoding follows the OpenStreetMap policy (1 request per second), and results are cached.
+- **Nothing is done twice.** Running the same command again reuses the downloaded terrain, the skylines and the index (same source, same cell size, area contained in the previous one). If a setting changes (step, camera height, area), only the map is rebuilt. `--force` redoes everything.
+- **Just download the terrain**: `crestline dem fetch --source ign --bbox … --out folder/`.
+- **Your own terrain model** (GeoTIFF, any coordinate system): `--dem my_dem.tif` instead of `--source`.
 
-## Utilisation
+## Usage
 
-### Deux modes de recherche
+### Two search modes
 
 ```
- MODE BRUTE                                  MODE INDEX
+ BRUTE MODE                                  INDEX MODE
  ──────────                                  ──────────
- map build                                   map build --index  (ou : map index CARTE)
- compare la photo à TOUS les points          l'index propose ~1 000 lieux, comparés exactement
- + rien d'autre à construire                 + ~1 s par photo, presque indépendant de la surface
- - coût proportionnel à la surface           - rate la bonne réponse ~5 % du temps
- → petite zone                               → région ou pays
+ map build                                   map build --index  (or: map index MAP)
+ compares the photo with EVERY viewpoint     the index proposes ~1,000 places, matched exactly
+ + nothing else to build                     + ~1 s per photo, almost independent of the area
+ - cost grows with the area                  - misses the right answer ~5 % of the time
+ → small areas                               → regions or countries
 ```
 
-Par défaut (`--mode auto`), l'index est utilisé s'il existe.
+By default (`--mode auto`), the index is used when it exists.
 
-### Sortie
+### Output
 
-Par défaut, les résultats vont dans `crestline_out/<horodatage>_<photo>/` ; on peut choisir un autre dossier
-avec `--out`.
+By default, results go to `crestline_out/<timestamp>_<photo>/`; choose another folder with `--out`.
 
 ```
-result.json        top 5 : lat/lon, cap, tangage, roulis, score, confiance, liens OpenStreetMap / Google Maps
-result.geojson     points + direction de visée (geojson.io, QGIS)
-summary.md         résumé lisible
-skyline.jpg        skyline détectée : vert = utilisée, rouge = ignorée (bord de nuage...)
-candidates.jpg     planche des 5 candidats
-candidates/N.jpg   le relief rendu depuis le candidat N, superposé à la photo
+result.json        top 5: lat/lon, heading, pitch, roll, score, confidence, OpenStreetMap / Google Maps links
+result.geojson     points + viewing direction (geojson.io, QGIS)
+summary.md         human-readable summary
+skyline.jpg        detected skyline: green = used, red = ignored (cloud edge...)
+candidates.jpg     contact sheet of the 5 candidates
+candidates/N.jpg   terrain rendered from candidate N, overlaid on the photo
 ```
 
-La **confiance** compare le score du 1er lieu à celui du 2e. Une bonne réponse se détache nettement ; quand
-plusieurs lieux se valent, la confiance est « faible » et le résultat est à prendre avec prudence.
+The **confidence** compares the score of the best place with the second one. A good answer stands out clearly;
+when several places score alike, confidence is "faible" (low) and the result should be treated with caution.
 
 ### Configuration
 
-| Réglage | Option | Défaut |
+| Setting | Option | Default |
 |---|---|---|
-| Source du relief | `--source ign\|swisstopo\|copernicus`, ou `--dem fichier.tif` | — |
-| Maille du relief téléchargé | `--cell` | 5 m (ign), 10 m (swisstopo), 30 m (copernicus) |
-| Zone de la carte | `--near "lieu" --radius 20`, `--bbox lon0,lat0,lon1,lat1`, ou `--bounds x0,y0,x1,y1` | tout le MNT |
-| Système de coordonnées | `--crs EPSG:2154` (reprojection automatique) | celui du MNT ; UTM si le MNT est en degrés |
-| Pas de grille | `--step` | 125 m |
-| Hauteur de la caméra | `--camera-height` (enregistrée dans la carte) | 1,7 m |
-| GPU | `--device cuda:0,cuda:1`, ou `--device cpu` | tous les GPU |
-| Modèle | `--model` (dépôt HF ou dossier local), ou `$CRESTLINE_MODEL` | `LPN64/crestline-convnext-base` |
-| Cache des poids | `$HF_HOME` | `~/.cache/huggingface` |
-| Cache (démo, cartes `--near`, géocodage) | `$CRESTLINE_CACHE` (`--cache` pour la démo) | `$XDG_CACHE_HOME/crestline` |
-| Confirmation des gros travaux | `--yes` | demandée au-delà de ~10 min, 2 Go téléchargés ou 10 Go sur disque |
-| Sortie | `--out`, `--top`, `--no-render` | `crestline_out/…`, 5 candidats |
-| Filtre de la skyline | `--min-conf` (0 : tout garder) | 0,6 |
+| Terrain source | `--source ign\|swisstopo\|copernicus`, or `--dem file.tif` | — |
+| Cell size of downloaded terrain | `--cell` | 5 m (ign), 10 m (swisstopo), 30 m (copernicus) |
+| Map area | `--near "place" --radius 20`, `--bbox lon0,lat0,lon1,lat1`, or `--bounds x0,y0,x1,y1` | whole DEM |
+| Coordinate system | `--crs EPSG:2154` (automatic reprojection) | the DEM's; UTM if the DEM is in degrees |
+| Grid step | `--step` | 125 m |
+| Camera height | `--camera-height` (stored in the map) | 1.7 m |
+| GPU | `--device cuda:0,cuda:1`, or `--device cpu` | all GPUs |
+| Model | `--model` (HF repo or local folder), or `$CRESTLINE_MODEL` | `LPN64/crestline-convnext-base` |
+| Weights cache | `$HF_HOME` | `~/.cache/huggingface` |
+| Cache (demo, `--near` maps, geocoding) | `$CRESTLINE_CACHE` (`--cache` for the demo) | `$XDG_CACHE_HOME/crestline` |
+| Confirmation for large jobs | `--yes` | asked above ~10 min, 2 GB of download or 10 GB on disk |
+| Output | `--out`, `--top`, `--no-render` | `crestline_out/…`, 5 candidates |
+| Skyline filter | `--min-conf` (0: keep everything) | 0.6 |
 
-### Focale
+### Focal length
 
-La focale réelle (zoom compris) est lue dans l'EXIF. Pour la convertir en pixels, l'outil utilise soit
-l'équivalent 35 mm, soit la densité de pixels du capteur, ce qui fonctionne aussi sur une photo redimensionnée.
-Si l'EXIF n'a rien, il faut la fournir avec `--fov` (champ horizontal, en degrés) ou avec `--focal-px`.
+The actual focal length (zoom included) is read from the EXIF. To convert it to pixels, Crestline uses either the
+35 mm equivalent or the sensor pixel density, which also works on resized photos. If the EXIF has neither, pass
+`--fov` (horizontal field of view, in degrees) or `--focal-px`.
 
-## Comment ça marche
+## How it works
 
 ```
-   PHOTO                                              MNT
+   PHOTO                                              TERRAIN MODEL
      │                                                 │
      ▼                                                 ▼
- Crestline (U-Net ConvNeXt)                   horizon sur 360° de chaque point
- skyline + confiance par colonne              d'une grille de 125 m, caméra à 1,7 m
+ Crestline (U-Net ConvNeXt)                   360° skyline of every point
+ skyline + per-column confidence              of a 125 m grid, camera at 1.7 m
      │                                                 │
      ▼                                                 ▼
- silhouette angulaire ────── comparaison (FFT : tous les caps d'un coup) ──────┐
- (focale, 11 tangages)        décalage vertical + pente (roulis) absorbés      │
+ angular profile ─────────── matching (FFT: every heading at once) ────────────┐
+ (focal length, 11 pitches)   vertical offset + slope (roll) absorbed          │
                                        │                                       │
                                        ▼                                       │
-                         100 meilleurs lieux ──▶ raffinement sur 25 m ──▶ top 5
+                         best 100 places ──▶ refinement at 25 m ──▶ top 5
 ```
 
-- **Crestline** est entraîné sans annotation manuelle. On a pris des photos dont la pose a été recalée par les bénévoles de [smapshot](https://smapshot.heig-vd.ch), puis on a calculé les crêtes par lancer de rayons dans le MNT suisse à 2 m. Détails sur la [fiche du modèle](https://huggingface.co/LPN64/crestline-convnext-base).
-- **L'horizon d'un point de vue** est, pour chaque direction, l'angle le plus haut sous lequel on voit le relief, jusqu'à 120 km, courbure terrestre et réfraction comprises.
-- **L'index** découpe chaque panorama en « mots de crête » (formes de 10° et de 4° de large). Les mots de la photo votent pour un lieu et un cap : un vrai lieu accumule des votes cohérents.
+- **The Crestline model** was trained without manual labelling. We took photos whose camera pose had been aligned by [smapshot](https://smapshot.heig-vd.ch) volunteers, then computed the ridges by ray casting into the 2 m Swiss terrain model. Details on the [model card](https://huggingface.co/LPN64/crestline-convnext-base).
+- **The skyline of a viewpoint** is, for every direction, the highest angle at which terrain is visible, up to 120 km, with Earth curvature and refraction.
+- **The index** cuts every panorama into "ridge words" (shapes 10° and 4° wide). The words of the photo vote for a place and a heading: the right place collects consistent votes.
 
-Le rapport complet se trouve dans [docs/PHASE2_geolocalisation.md](docs/PHASE2_geolocalisation.md).
+The full report (in French) is in [docs/PHASE2_geolocalisation.md](docs/PHASE2_geolocalisation.md).
 
-## Résultats
+## Results
 
-Une photo compte comme bien localisée si le meilleur candidat est à moins de 1 km de la vérité.
+A photo counts as correctly located when the best candidate is within 1 km of the truth.
 
-| Jeu de test | Mode brute | Mode index |
+| Test set | Brute mode | Index mode |
 |---|---|---|
-| CH1 (203 photos des Alpes suisses, ETH Zurich) | **88,2 %** | 87,7 % |
-| smapshot (459 photos prises du sol, zones jamais vues) | **73,4 %** | 71,7 % |
+| CH1 (203 photos of the Swiss Alps, ETH Zurich) | **88.2 %** | 87.7 % |
+| smapshot (459 ground-level photos, areas never seen in training) | **73.4 %** | 71.7 % |
 
-- Quand la photo est bien localisée, l'erreur médiane est de 40 m et l'erreur de cap de 0,5°.
-- La référence publique sur CH1 (Baatz et al., 2012) est de 88 %, avec des skylines en partie corrigées à la main.
+- When a photo is correctly located, the median error is 40 m and the heading error 0.5°.
+- The public reference on CH1 (Baatz et al., 2012) is 88 %, with skylines partly corrected by hand.
 
-## Limites
+## Limitations
 
-- **Une photo seule prise en fond de vallée est un cas limite** : versants proches, peu de sommets lointains. Sur un panorama des Pyrénées, chaque vue de 70° échoue, alors que la silhouette complète du panorama retrouve la position à 170 m.
-- **La qualité du MNT est décisive.** Avec les MNT mondiaux (Copernicus, FABDEM, 30 m), CH1 tombe à ~68 %. Leurs erreurs de 20 à 40 m sur les arêtes suffisent à brouiller la silhouette. Utilisez des MNT lidar nationaux (`--source ign`, `--source swisstopo`, ou votre fichier).
-- Il faut une skyline visible : ciel bouché, sommets dans les nuages ou cadrage serré sur une paroi font échouer la localisation.
-- La caméra est supposée près du sol (randonneur). Les vues aériennes ne sont pas gérées.
-- Une carte de la taille de la Suisse au pas de 125 m pèse ~27 Go, et ~18 Go de plus avec l'index.
+- **A single photo taken from a valley floor is a hard case**: nearby slopes dominate and few distant peaks are visible. On a Pyrenees panorama, every 70° view fails, while the full 360° skyline finds the spot within 170 m.
+- **Terrain quality is decisive.** With global models (Copernicus, FABDEM, 30 m), CH1 drops to ~68 %: their 20-40 m errors on ridges blur the skyline. Use national lidar models (`--source ign`, `--source swisstopo`, or your own file).
+- The skyline must be visible: overcast sky, summits in clouds or a tight shot of a rock face make localisation fail.
+- The camera is assumed near the ground (hiker's eye level). Aerial views are not handled.
+- A Switzerland-sized map at a 125 m step takes ~27 GB, plus ~18 GB for the index.
 
 ## Tests
 
@@ -222,19 +223,19 @@ Une photo compte comme bien localisée si le meilleur candidat est à moins de 1
 pip install -e ".[dev]" && pytest
 ```
 
-Le test tourne sur CPU, sans téléchargement : il fabrique un relief synthétique, rend une photo depuis un point
-connu, et vérifie que les deux modes retrouvent ce point et son cap.
+The test runs on CPU without any download. It builds a synthetic terrain, renders a photo from a known point, and
+checks that both modes find that point and its heading.
 
-## Recherche
+## Research
 
-L'entraînement de Crestline et les évaluations se trouvent dans `scripts/`, à installer avec
-`pip install -e ".[research]"`. Voir [docs/RECHERCHE.md](docs/RECHERCHE.md).
+Training of the Crestline model and the evaluations live in `scripts/` (install with
+`pip install -e ".[research]"`). See [docs/RECHERCHE.md](docs/RECHERCHE.md) (in French).
 
-## Licences et attributions
+## Licences and attribution
 
-- **Code** : Apache-2.0.
-- **Modèle Crestline** : CC BY-SA 4.0 (voir sa fiche).
-- **Relief** : swissALTIRegio © swisstopo ; RGE ALTI © IGN (Licence Ouverte Etalab 2.0) ; Copernicus DEM © DLR e.V. 2010-2014 et © Airbus 2014-2018, ESA.
-- **Photo de démo** (lac d'Anterne) : © l'auteur, CC BY 4.0.
-- Les poses d'entraînement viennent de smapshot (HEIG-VD, ETH-Bibliothek, swisstopo) et de ses contributeurs bénévoles.
-- L'évaluation utilise CH1 (Baatz, Saurer, Köser, Pollefeys, ETH Zurich).
+- **Code**: Apache-2.0.
+- **Crestline model**: CC BY-SA 4.0 (see its card).
+- **Terrain**: swissALTIRegio © swisstopo; RGE ALTI © IGN (Licence Ouverte Etalab 2.0); Copernicus DEM © DLR e.V. 2010-2014 and © Airbus 2014-2018, ESA.
+- **Demo photo** (Lac d'Anterne): © the author, CC BY 4.0.
+- Training camera poses come from smapshot (HEIG-VD, ETH-Bibliothek, swisstopo) and its volunteer contributors.
+- Evaluation uses CH1 (Baatz, Saurer, Köser, Pollefeys, ETH Zurich).

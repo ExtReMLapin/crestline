@@ -1,7 +1,7 @@
 [project]
 name = "crestline"
 version = "0.1.0"
-description = "Retrouver d'où une photo de montagne a été prise, à partir de sa ligne d'horizon et d'un modèle de terrain."
+description = "Find where a mountain photo was taken, without GPS, from its skyline."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -48,7 +48,7 @@ build-backend = "hatchling.build"
 packages = ["crestline"]
 
 [tool.hatch.build.targets.sdist]
-include = ["crestline", "tests", "README.md", "LICENSE"]
+include = ["crestline", "tests", "README.md", "README_FR.md", "LICENSE"]
 
 # Développement avec uv : torch CUDA 13 (RTX 50xx)
 [tool.uv.sources]
