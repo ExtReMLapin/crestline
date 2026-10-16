@@ -127,12 +127,25 @@ crestline locate https://exemple.org/photo.jpg --map cartes/anterne --fov 65   #
  ──────────                                  ──────────
  map build                                   map build --index  (ou : map index CARTE)
  compare la photo à TOUS les points          l'index propose ~1 000 lieux, comparés exactement
- + rien d'autre à construire                 + ~1 s par photo, presque indépendant de la surface
+ + rien d'autre à construire                 + ~0,1 s par photo, presque indépendant de la surface
  - coût proportionnel à la surface           - rate la bonne réponse ~5 % du temps
  → petite zone                               → région ou pays
 ```
 
 Par défaut (`--mode auto`), l'index est utilisé s'il existe.
+
+### Vitesse et mémoire GPU
+
+Mesuré sur une RTX 5090 avec une carte de toute la Suisse (5 millions de points de vue) :
+
+- **Localiser une photo** prend ~0,09 s en mode index (version 0.1 : ~1,5 s sur un GPU, ~1 s sur trois).
+- **Construire une carte** calcule ~25 000 points de vue par seconde : la carte de la démo (230 000 points de vue)
+  se construit en ~10 s au lieu de ~1 min.
+- **Mémoire GPU** : le relief passe en premier sur le GPU. L'index (4,6 Go pour la Suisse) et, en mode brute, les
+  horizons suivent morceau par morceau tant qu'il reste de la place ; le reste reste en mémoire centrale, plus
+  lent mais fonctionnel.
+- Les deux calculs lourds (lancer de rayons, votes de l'index) tournent en noyaux GPU [Triton](https://triton-lang.org).
+  Sans Triton (CPU, macOS, Windows), ou avec `CRESTLINE_NO_TRITON=1`, la version PyTorch simple prend le relais.
 
 ### Sortie
 
@@ -204,11 +217,35 @@ Une photo compte comme bien localisée si le meilleur candidat est à moins de 1
 
 | Jeu de test | Mode brute | Mode index |
 |---|---|---|
-| CH1 (203 photos des Alpes suisses, ETH Zurich) | **88,2 %** | 87,7 % |
+| CH1 (203 photos des Alpes suisses, ETH Zurich) | **88,7 %** | 88,2 % |
 | smapshot (459 photos prises du sol, zones jamais vues) | **73,4 %** | 71,7 % |
+| Test de CrossLocate (3 513 photos prises en Suisse, Université technique de Brno) | — | **59,8 %** |
 
-- Quand la photo est bien localisée, l'erreur médiane est de 40 m et l'erreur de cap de 0,5°.
+- Quand la photo est bien localisée, l'erreur médiane est de 40 m et l'erreur de cap de 0,5° (smapshot).
 - La référence publique sur CH1 (Baatz et al., 2012) est de 88 %, avec des skylines en partie corrigées à la main.
+
+### Comparaison avec CrossLocate
+
+[CrossLocate](https://github.com/JanTomesek/CrossLocate) (Tomešek, Čadík, Brejcha, WACV 2022) compare la photo à
+des cartes de profondeur rendues, avec un descripteur appris. Sur son propre jeu de test, il annonce **38,7 %** à
+moins de 1 km (72,6 % dans ses 100 premiers lieux). Crestline atteint **59,8 %** sur les mêmes 3 513 photos
+(65,7 % dans ses 20 premiers), avec une erreur de cap médiane de 0,85° quand la position est juste.
+
+| Photos du jeu de test | Nombre | Crestline (mode index) |
+|---|---|---|
+| Flickr | 962 | 77,0 % |
+| LandscapeAR (poses par reconstruction 3D) | 2 327 | 49,9 % |
+| CH1 (déjà dans notre ligne CH1) | 196 | 90,8 % |
+
+À lire avec précaution :
+
+- **Relief** : Crestline utilise le modèle national suisse (10 m), CrossLocate un modèle mondial à 30 m. Sur CH1,
+  un modèle mondial à 30 m suffit à faire passer Crestline de 88 % à ~68 %.
+- **Focale** : Crestline en a besoin (fournie par le jeu de test) ; CrossLocate annonce 31,5 % sans elle.
+- **Données d'entraînement** : le modèle Crestline a été entraîné sur des photos suisses, alors que CrossLocate
+  a réservé la Suisse au test. Aucune des 3 513 photos de test ne fait partie de nos photos d'entraînement
+  (empreintes d'image, puis vérification à l'œil).
+- Les photos sont réduites à 1 536 px de grand côté, comme le fait `crestline locate`.
 
 ## Limites
 
@@ -239,4 +276,5 @@ L'entraînement de Crestline et les évaluations se trouvent dans `scripts/`, à
 - **Relief** : swissALTIRegio © swisstopo ; RGE ALTI © IGN (Licence Ouverte Etalab 2.0) ; Copernicus DEM © DLR e.V. 2010-2014 et © Airbus 2014-2018, ESA.
 - **Photo de démo** (lac d'Anterne) : © l'auteur, CC BY 4.0.
 - Les poses d'entraînement viennent de smapshot (HEIG-VD, ETH-Bibliothek, swisstopo) et de ses contributeurs bénévoles.
-- L'évaluation utilise CH1 (Baatz, Saurer, Köser, Pollefeys, ETH Zurich).
+- L'évaluation utilise CH1 (Baatz, Saurer, Köser, Pollefeys, ETH Zurich) et le jeu de test de CrossLocate (Tomešek,
+  Čadík, Brejcha, Université technique de Brno), construit à partir de GeoPose3K et LandscapeAR.

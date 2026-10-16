@@ -2,6 +2,38 @@
 
 État au 2026-10-08. Tout est calculé localement, et les photos de l'utilisateur ne quittent pas la machine.
 
+## Mise à jour 0.2 (2026-10-16) : ~18x plus rapide, test CrossLocate
+
+Mêmes résultats, ~18x plus vite sur un GPU : localisation en mode index ~1,45 s -> ~0,08 s par photo (RTX 5090).
+
+| Étape (par photo, 1 GPU) | 0.1 | 0.2 | Comment |
+|---|---|---|---|
+| index (présélection) | 0,46 s | 0,03 s | index sur GPU sans les mots jamais lus (64 % des entrées), vote en un noyau Triton, votes par tuiles qui tiennent dans le cache L2 |
+| raffinement | 0,73 s | 0,04 s | horizons calculés dans la fenêtre de la photo ± 15°, lancer de rayons en un noyau Triton |
+| reste | ~0,25 s | ~0,01 s | photos préchargées |
+
+- **Exactitude.** L'index propose les mêmes lieux (seul l'ordre des égalités change). Le lancer de rayons fusionné
+  compte les positions depuis le coin du MNT : en float32, les coordonnées LV95 (~2,6e6 m) ne sont justes qu'à
+  ~25 cm, ce qui faisait bouger un relief à moins de 100 m de la caméra de jusqu'à ~0,8°. Contre une référence en
+  float64 : écart moyen 0,018° (0.1) -> 0,003° (0.2).
+- **Fenêtre du raffinement.** À ± 5°, le taux de réussite ne bougeait pas mais la position se dégradait un peu
+  (smapshot : 40 -> 43 m en médiane, cap max 7 -> 9,9°) ; à ± 15°, on retrouve le raffinement sur 360° pour 4 % du
+  coût en plus.
+
+| Jeu de test | brute 0.1 | brute 0.2 | index 0.1 | index 0.2 |
+|---|---|---|---|---|
+| CH1 | 88,2 % | 88,7 % | 87,7 % | 88,2 % |
+| smapshot test | 73,4 % | 73,4 % | 71,7 % | 71,7 % |
+| test CrossLocate (3 513 photos) | — | — | — | 59,8 % |
+
+Photo par photo, la 0.2 tombe au même point que la 0.1 pour l'immense majorité des photos ; les écarts restants
+sont équilibrés (smapshot brute : 9 photos plus près de la vérité, 8 plus loin ; erreur médiane 40 m inchangée).
+
+**Test CrossLocate** (Tomešek et al., WACV 2022, 38,7 % annoncés) : 59,8 % à 1 km au premier rang, 65,7 % dans les 20
+premiers ; Flickr 77,0 %, LandscapeAR 49,9 % (poses par reconstruction 3D : la vraie position n'est dans la
+présélection que pour 69 % d'entre elles), CH1 90,8 %. Erreur médiane 219 m, cap 0,85° quand c'est juste. Leur
+`yaw` vaut ~269,6° - cap grille. Aucune photo de test dans notre entraînement (scripts/overlap_check.py).
+
 ## TL;DR
 
 - **CH1** (203 photos de référence, ETH) : **88,2 % localisées à moins de 1 km au premier essai**.

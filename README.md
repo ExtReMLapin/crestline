@@ -127,12 +127,24 @@ the matching works at ~0.15°.
  ──────────                                  ──────────
  map build                                   map build --index  (or: map index MAP)
  compares the photo with EVERY viewpoint     the index proposes ~1,000 places, matched exactly
- + nothing else to build                     + ~1 s per photo, almost independent of the area
+ + nothing else to build                     + ~0.1 s per photo, almost independent of the area
  - cost grows with the area                  - misses the right answer ~5 % of the time
  → small areas                               → regions or countries
 ```
 
 By default (`--mode auto`), the index is used when it exists.
+
+### Speed and GPU memory
+
+Measured on one RTX 5090 with a map of all of Switzerland (5 million viewpoints):
+
+- **Locating a photo** takes ~0.09 s in index mode (version 0.1: ~1.5 s on one GPU, ~1 s on three).
+- **Building a map** computes ~25,000 viewpoints per second: the demo map (230,000 viewpoints) takes ~10 s
+  instead of ~1 min.
+- **GPU memory**: the terrain model goes on the GPU first. The index (4.6 GB for Switzerland) and, in brute mode,
+  the skylines follow piece by piece as long as there is room; the rest stays in RAM, slower but working.
+- The two heavy computations (ray casting, index votes) run as [Triton](https://triton-lang.org) GPU kernels. Without
+  Triton (CPU, macOS, Windows), or with `CRESTLINE_NO_TRITON=1`, the plain PyTorch version is used.
 
 ### Output
 
@@ -203,11 +215,34 @@ A photo counts as correctly located when the best candidate is within 1 km of th
 
 | Test set | Brute mode | Index mode |
 |---|---|---|
-| CH1 (203 photos of the Swiss Alps, ETH Zurich) | **88.2 %** | 87.7 % |
+| CH1 (203 photos of the Swiss Alps, ETH Zurich) | **88.7 %** | 88.2 % |
 | smapshot (459 ground-level photos, areas never seen in training) | **73.4 %** | 71.7 % |
+| CrossLocate test set (3,513 photos taken in Switzerland, Brno University of Technology) | — | **59.8 %** |
 
-- When a photo is correctly located, the median error is 40 m and the heading error 0.5°.
+- When a photo is correctly located, the median error is 40 m and the heading error 0.5° (smapshot).
 - The public reference on CH1 (Baatz et al., 2012) is 88 %, with skylines partly corrected by hand.
+
+### Comparison with CrossLocate
+
+[CrossLocate](https://github.com/JanTomesek/CrossLocate) (Tomešek, Čadík, Brejcha, WACV 2022) matches the photo
+against rendered depth maps with a learned descriptor. On its own test set it reports **38.7 %** within 1 km
+(72.6 % within its top 100). Crestline reaches **59.8 %** on the same 3,513 photos (65.7 % within its top 20),
+with a median heading error of 0.85° when correct.
+
+| Photos of the test set | Count | Crestline (index mode) |
+|---|---|---|
+| Flickr | 962 | 77.0 % |
+| LandscapeAR (poses from structure-from-motion) | 2,327 | 49.9 % |
+| CH1 (also in our CH1 row) | 196 | 90.8 % |
+
+Read with care:
+
+- **Terrain**: Crestline uses the Swiss national model (10 m); CrossLocate rendered a 30 m global model. On CH1,
+  a 30 m global model alone takes Crestline from 88 % down to ~68 %.
+- **Focal length**: Crestline needs it (given by the test set); CrossLocate reports 31.5 % without it.
+- **Training data**: the Crestline model was trained on Swiss photos, while CrossLocate kept Switzerland for testing
+  only. None of the 3,513 test photos is among our training photos (image fingerprints, then checked by eye).
+- Photos are resized to 1,536 px on the long side, as `crestline locate` does.
 
 ## Limitations
 
@@ -238,4 +273,5 @@ Training of the Crestline model and the evaluations live in `scripts/` (install 
 - **Terrain**: swissALTIRegio © swisstopo; RGE ALTI © IGN (Licence Ouverte Etalab 2.0); Copernicus DEM © DLR e.V. 2010-2014 and © Airbus 2014-2018, ESA.
 - **Demo photo** (Lac d'Anterne): © the author, CC BY 4.0.
 - Training camera poses come from smapshot (HEIG-VD, ETH-Bibliothek, swisstopo) and its volunteer contributors.
-- Evaluation uses CH1 (Baatz, Saurer, Köser, Pollefeys, ETH Zurich).
+- Evaluation uses CH1 (Baatz, Saurer, Köser, Pollefeys, ETH Zurich) and the CrossLocate test set (Tomešek, Čadík,
+  Brejcha, Brno University of Technology), built from GeoPose3K and LandscapeAR.
