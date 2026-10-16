@@ -28,3 +28,4 @@ hf_release/
 # Notes de travail internes (IP, machines) : jamais sur GitHub
 docs/HANDOFF.md
 RAPPORT_NUIT.md
+crestline_out/

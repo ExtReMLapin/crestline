@@ -16,7 +16,7 @@ from PIL import Image
 from . import model as skyline_model
 from .camera import focal_px_from_exif, focal_px_from_fov, gps_from_exif
 from .dem import true_north_offset
-from .maps import Map, gpu_devices
+from .maps import GPU_RESERVE, Map, free_bytes, gpu_devices
 from .match import (MIN_SKYLINE_CONF, PITCHES, MIN_BINS, Query, fit_pose, photo_profiles, profile_ffts, refine, reliable_columns,
                     score_all, skyline_rows, top_candidates)
 
@@ -47,13 +47,28 @@ class Locator:
         self.points = self.map.points
         self._gpu_elev = None
 
-    def gpu_elev(self):
-        """Mode brute : horizons de la carte répartis sur les GPU, gardés entre deux photos."""
+    def gpu_elev(self, slab=250_000):
+        """Mode brute : horizons de la carte répartis entre les GPU et gardés entre deux photos. Chaque GPU prend
+        sa bande par tranches tant qu'il lui reste de la place (marge GPU_RESERVE) ; le reste de la bande reste
+        en mémoire centrale et sera lu en flux à chaque photo (plus lent, mais ça marche)."""
         if self._gpu_elev is None:
             elev = self.map.elev
+            self.map.dem(self.device)                      # le MNT passe avant : il est indispensable
             b = np.linspace(0, len(elev), len(self.devices) + 1).astype(int)
-            self._gpu_elev = [torch.from_numpy(np.array(elev[b[i]:b[i + 1]])).to(d)
-                              for i, d in enumerate(self.devices)]
+            parts, streamed = [], 0
+            for i, d in enumerate(self.devices):
+                lo = b[i]
+                while lo < b[i + 1] and free_bytes(d) - GPU_RESERVE > slab * elev.shape[1] * 2:
+                    hi = min(lo + slab, b[i + 1])
+                    parts.append(torch.from_numpy(np.array(elev[lo:hi])).to(d))
+                    lo = hi
+                if lo < b[i + 1]:
+                    parts.append((elev[lo:b[i + 1]], d))
+                    streamed += b[i + 1] - lo
+            if streamed:
+                print(f"carte : {streamed / len(elev):.0%} des horizons restent en mémoire centrale (GPU plein), "
+                      "lus en flux : mode brute plus lent")
+            self._gpu_elev = parts
         return self._gpu_elev
 
     def locate(self, photo, focal_px=None, fov=None, mode="auto", k=5, n_places=1000, n_refine=100,
@@ -104,13 +119,14 @@ class Locator:
             rms, shift, pitch = score_all((P, M), self.gpu_elev())
             pos = pts
         else:
-            idx = np.sort(self.map.index().query(P[j0], M[j0], k_center, n_places, device=self.device))
+            idx = np.sort(self.map.index(self.device).query(P[j0], M[j0], k_center, n_places, device=self.device))
             B, B2 = profile_ffts(torch.as_tensor(np.asarray(self.map.elev[idx]), device=self.device))
             rms, shift, pitch = (t.cpu().numpy() for t in q.score(B, B2))
             pos = pts[idx]
         dem = self.map.dem(self.device)
         cand = top_candidates(pos, rms, n_refine, radius=500.0)
-        pos, rms, shift, pitch = refine(dem, q, pos[cand], self.map.camera_height)
+        width = int(np.nonzero(M.max(0))[0].max()) + 1               # cases couvertes par la photo
+        pos, rms, shift, pitch = refine(dem, q, pos[cand], self.map.camera_height, shifts=shift[cand], width=width)
         best = top_candidates(pos, rms, k)
         delta = 360.0 / q.n_az
         ratio, level = confidence(rms[best])

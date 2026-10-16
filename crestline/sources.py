@@ -262,6 +262,13 @@ def choose_source(bbox_lonlat, country=None):
     return "copernicus"
 
 
+def build_rate():
+    """Points de vue calculés par seconde (un GPU, mesuré sur RTX 5090) : noyau Triton ~6x plus rapide."""
+    import torch
+    from .kernels import HAVE_TRITON
+    return 25_000 if HAVE_TRITON and torch.cuda.is_available() else 4000
+
+
 def estimate(source, bbox_lonlat, cell=None, step=125.0, download=True, build=True, index=True):
     """Ordres de grandeur avant de lancer : téléchargement, disque, mémoire GPU, temps."""
     cell = float(cell or SOURCES[source][1])
@@ -281,7 +288,7 @@ def estimate(source, bbox_lonlat, cell=None, step=125.0, download=True, build=Tr
         est["minutes"] += (fine + coarse) / 4e6 * seconds_per_tile / 60
     if build:
         est["disk_gb"] += points * (1440 * 2 + 24) / 1e9
-        est["minutes"] += points / 4000 / 60
+        est["minutes"] += points / build_rate() / 60
     if index:
         est["disk_gb"] += points * 3700 / 1e9
         est["minutes"] += points / 650_000

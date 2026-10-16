@@ -29,6 +29,16 @@ N_AZ = 1440
 INDEX_SHARD = 2_000_000          # points par morceau d'index (borne la mémoire de construction)
 
 
+GPU_RESERVE = 6e9                 # octets laissés libres sur chaque GPU : calculs, votes, modèle
+
+
+def free_bytes(device):
+    """Mémoire libre sur un GPU (0 pour le CPU : rien n'y est « chargé sur GPU »)."""
+    if not str(device).startswith("cuda"):
+        return 0
+    return torch.cuda.mem_get_info(torch.device(device))[0]
+
+
 def gpu_devices():
     n = torch.cuda.device_count()
     return [f"cuda:{i}" for i in range(n)] if n else ["cpu"]
@@ -169,9 +179,16 @@ class Map:
     def has_index(self):
         return (self.path / "index").exists()
 
-    def index(self):
+    def index(self, device=None):
+        """Index de mots de crête. Ses morceaux passent sur le GPU un par un tant qu'il y a la place (même résultat,
+        ~4x plus rapide) ; les autres restent en mémoire centrale."""
         if self._index is None:
             self._index = ShardedIndex(sorted((self.path / "index").glob("shard_*")))
+            if device is not None and str(device).startswith("cuda"):
+                self.dem(device)                           # le MNT passe avant : il est indispensable
+                n = self._index.to_gpu(device, reserve=GPU_RESERVE)
+                if n < len(self._index.shards):
+                    print(f"index : {n}/{len(self._index.shards)} morceaux sur GPU, les autres en mémoire centrale")
         return self._index
 
     def dem(self, device):

@@ -20,6 +20,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import kernels
+
 BIN = 0.25                    # degrés par case des profils de la base
 WIDTHS = (10.0, 4.0)          # largeurs des mots (degrés) : deux échelles, pour les photos au champ étroit
 N_SAMPLES = 8                 # valeurs par mot
@@ -88,6 +90,57 @@ def soft_variants(word, rel, scale, n_flip=2, margin=SOFT_MARGIN):
     return out
 
 
+def query_words(P, M, soft=True):
+    """Mots de la photo (et leurs variantes proches d'un seuil) : liste de (mot, direction du mot dans la photo)."""
+    queries = []
+    for scale in range(len(WIDTHS)):
+        w, d, ok, rel = words_from_profile(P, M, circular=False, with_rel=True, scale=scale)
+        queries += [(v, dq) for word, dq, r in zip(w[ok].tolist(), d[ok].tolist(), rel[ok])
+                    for v in (soft_variants(word, r, scale) if soft else [word])]
+    return queries
+
+
+def _vote(votes, pts, dirs, dq, weight, k_center):
+    """Un vote par entrée : cap de l'axe optique = direction du mot dans la base - décalage du mot dans la photo."""
+    n_head = int(round(360 / HEADING_BIN))
+    head = (dirs * STRIDE - (dq - k_center * BIN)) % 360
+    hb = (head / HEADING_BIN).long() % n_head
+    votes.index_add_(0, pts * n_head + hb, weight)
+
+
+def _smooth_max(v):
+    """Tolérance d'un cran sur le cap (somme glissante sur 3 cases), puis meilleur cap de chaque lieu."""
+    return (v + v.roll(1, 1) + v.roll(-1, 1)).max(1)
+
+
+_fused = {}
+
+
+def smooth_max(v):
+    """_smooth_max fusionné en un seul passage sur GPU (torch.compile) ; version simple sinon, ou en cas d'échec."""
+    if v.is_cuda and "f" not in _fused:
+        try:
+            _fused["f"] = torch.compile(_smooth_max, dynamic=False)
+            _fused["f"](v[:2])
+        except Exception:                                   # pas de compilateur : version simple
+            _fused["f"] = _smooth_max
+    return (_fused.get("f", _smooth_max) if v.is_cuda else _smooth_max)(v)
+
+
+def top_votes(votes, n_points, k, per_place=False):
+    """k meilleurs (lieu, cap) après la tolérance d'un cran sur le cap ; per_place : k lieux distincts, chacun
+    avec son meilleur cap (même liste de lieux, sans trier les 600 M de couples (lieu, cap))."""
+    n_head = int(round(360 / HEADING_BIN))
+    v = votes.view(n_points, n_head)
+    if per_place:
+        best, head = smooth_max(v)
+        top = torch.topk(best, min(k, n_points))
+        return top.indices.cpu().numpy(), (head[top.indices] * HEADING_BIN).cpu().numpy(), top.values.cpu().numpy()
+    top = torch.topk((v + v.roll(1, 1) + v.roll(-1, 1)).view(-1), min(k, v.numel()))
+    idx = top.indices.cpu().numpy()
+    return idx // n_head, (idx % n_head) * HEADING_BIN, top.values.cpu().numpy()
+
+
 class RidgeIndex:
     """Index inversé en mémoire : postings triés par mot (CSR)."""
 
@@ -129,32 +182,124 @@ class RidgeIndex:
         return cls(np.load(d / "offsets.npy"), np.load(d / "point.npy", mmap_mode="r"),
                    np.load(d / "direction.npy", mmap_mode="r"), int(np.load(d / "n_points.npy")))
 
-    def query(self, P, M, k_center, k=1000, max_postings=2_000_000, device="cuda", soft=True):
+    def query(self, P, M, k_center, k=1000, max_postings=2_000_000, device="cuda", soft=True, chunk=20_000_000):
         """P, M : profil photo (une hypothèse de tangage, cases de BIN degrés, case 0 = bord gauche) ;
         k_center : case de l'axe optique. Renvoie les k meilleurs (point, cap en degrés) et leurs votes."""
         n_head = int(round(360 / HEADING_BIN))
         votes = torch.zeros(self.n_points * n_head, dtype=torch.float32, device=device)
-        queries = []
-        for scale in range(len(WIDTHS)):
-            w, d, ok, rel = words_from_profile(P, M, circular=False, with_rel=True, scale=scale)
-            queries += [(v, dq) for word, dq, r in zip(w[ok].tolist(), d[ok].tolist(), rel[ok])
-                        for v in (soft_variants(word, r, scale) if soft else [word])]
-        for word, dq in queries:
-            a, b = self.offsets[word], self.offsets[word + 1]
-            if b - a == 0 or b - a > max_postings:            # absent, ou mot trop banal
-                continue
-            pts = torch.from_numpy(np.array(self.point[a:b])).to(device).long()
-            dirs = torch.from_numpy(np.array(self.direction[a:b])).to(device).float() * STRIDE
-            # cap de l'axe optique = direction du mot dans la base - décalage du mot dans la photo
-            head = (dirs - (dq - k_center * BIN)) % 360
-            hb = (head / HEADING_BIN).long() % n_head
-            votes.index_add_(0, pts * n_head + hb, torch.full_like(head, float(self.idf[word])))
-        # tolérance d'un cran sur le cap : somme glissante sur 3 cases
-        v = votes.view(self.n_points, n_head)
-        v = v + v.roll(1, 1) + v.roll(-1, 1)
-        top = torch.topk(v.view(-1), k)
-        idx = top.indices.cpu().numpy()
-        return idx // n_head, (idx % n_head) * HEADING_BIN, top.values.cpu().numpy()
+        spans = [(self.offsets[w], self.offsets[w + 1], w, dq) for w, dq in query_words(P, M, soft)]
+        spans = [sp for sp in spans if 0 < sp[1] - sp[0] <= max_postings]       # absent, ou mot trop banal
+        batch, size = [], 0                     # par paquets : un transfert et un index_add par paquet
+        for i, sp in enumerate(spans):
+            batch.append(sp)
+            size += sp[1] - sp[0]
+            if size >= chunk or i == len(spans) - 1:
+                pts = np.concatenate([self.point[a:b] for a, b, _, _ in batch])
+                dirs = np.concatenate([self.direction[a:b] for a, b, _, _ in batch])
+                lens = torch.as_tensor([b - a for a, b, _, _ in batch], device=device)
+                dq = torch.tensor([x[3] for x in batch], dtype=torch.float32, device=device)
+                w = torch.as_tensor(self.idf[[x[2] for x in batch]], device=device)
+                _vote(votes, torch.as_tensor(pts, device=device).long(), torch.as_tensor(dirs, device=device).float(),
+                      torch.repeat_interleave(dq, lens), torch.repeat_interleave(w, lens), k_center)
+                batch, size = [], 0
+        return top_votes(votes, self.n_points, k)
+
+
+class GpuIndex:
+    """Le même index entièrement sur GPU, sans perte par rapport à RidgeIndex.query :
+    - seuls les mots utilisables sont gardés : un mot présent dans plus de max_postings lieux n'est jamais lu
+      (horizons plats, pentes régulières), et c'est ~64 % des entrées sur la base suisse ;
+    - lieu et direction dans un seul int32 (lieu << 9 | direction en degrés).
+    Base suisse : 3,16 G entrées (18 Go sur disque) -> 1,15 G sur GPU (4,6 Go)."""
+
+    DIR_BITS = 9
+
+    def __init__(self, index, max_postings=2_000_000, device="cuda", chunk=50_000_000):
+        assert index.n_points < 2 ** (31 - self.DIR_BITS)
+        counts = np.diff(index.offsets)
+        keep = counts <= max_postings
+        self.offsets = torch.as_tensor(np.concatenate([[0], np.cumsum(np.where(keep, counts, 0))]), device=device)
+        self.idf = torch.as_tensor(index.idf, device=device)
+        self.n_points, self.device = index.n_points, device
+        self.packed = torch.empty(int(self.offsets[-1]), dtype=torch.int32, device=device)
+        dropped = np.nonzero(~keep & (counts > 0))[0]          # entrées gardées : entre deux mots écartés
+        bounds = [0] + [int(x) for w in dropped for x in (index.offsets[w], index.offsets[w + 1])] + [int(index.offsets[-1])]
+        out = 0
+        for a, b in zip(bounds[0::2], bounds[1::2]):
+            for i in range(a, b, chunk):
+                j = min(i + chunk, b)
+                pt = torch.from_numpy(np.array(index.point[i:j])).to(device)          # copie : mmap en lecture seule
+                dr = torch.from_numpy(np.asarray(index.direction[i:j]).astype(np.int32)).to(device)
+                self.packed[out:out + j - i] = (pt << self.DIR_BITS) | dr
+                out += j - i
+
+    @staticmethod
+    def bytes_needed(index, max_postings=2_000_000):
+        counts = np.diff(index.offsets)
+        return int(counts[counts <= max_postings].sum()) * 4
+
+    def default_tile(self):
+        """Lieux par tuile de votes : ~1/4 du cache L2 (RTX 5090 : 96 Mo -> ~16 000 lieux), au plus 256 tuiles."""
+        l2 = torch.cuda.get_device_properties(torch.device(self.device)).L2_cache_size
+        return max(l2 // 4 // (int(round(360 / HEADING_BIN)) * 4), (self.n_points + 255) // 256)
+
+    def query(self, queries, k_center, k=1000, chunk=100_000_000, tile=None):
+        """queries : query_words(...). Renvoie k lieux distincts (leur meilleur cap) et leurs votes.
+        tile : lieux par tuile de votes (0 : sans tuiles ; défaut : selon le cache L2)."""
+        dev = self.device
+        n_head = int(round(360 / HEADING_BIN))
+        size = self.n_points * n_head
+        shared = getattr(self, "votes", None)                 # tableau partagé entre morceaux (ShardedIndex)
+        votes = shared[:size].zero_() if shared is not None and len(shared) >= size else \
+            torch.zeros(size, dtype=torch.float32, device=dev)
+        if not queries:
+            return top_votes(votes, self.n_points, k, per_place=True)
+        words = torch.tensor([w for w, _ in queries], dtype=torch.long, device=dev)
+        dq = torch.tensor([d for _, d in queries], dtype=torch.float32, device=dev)
+        a, n = self.offsets[words], self.offsets[words + 1] - self.offsets[words]
+        live = n > 0
+        a, n, dq, idf = a[live], n[live], dq[live], self.idf[words[live]]
+        if len(n) == 0:                                       # aucun mot présent dans ce morceau
+            return top_votes(votes, self.n_points, k, per_place=True)
+        if kernels.available(dev) and STRIDE == 1.0 and HEADING_BIN == 1.0:
+            tile = self.default_tile() if tile is None else tile
+            if tile:
+                a, n, dq, idf = self._tiles(a, n, dq, idf, tile)
+            ends = torch.cumsum(n, 0)
+            kernels.vote(self.packed, ends, a - (ends - n), dq, idf, votes, int(ends[-1]), k_center * BIN,
+                         n_head, self.DIR_BITS)
+            return top_votes(votes, self.n_points, k, per_place=True)
+        ends = torch.cumsum(n, 0)
+        lo = 0
+        while lo < len(n):                                    # paquets d'au plus `chunk` entrées
+            hi = max(int(torch.searchsorted(ends, ends[lo] - n[lo] + chunk, right=True)), lo + 1)
+            nn = n[lo:hi]
+            rep = torch.repeat_interleave(torch.arange(hi - lo, device=dev), nn)
+            start = torch.cumsum(nn, 0) - nn
+            e = self.packed[a[lo:hi][rep] + (torch.arange(len(rep), device=dev) - start[rep])]
+            _vote(votes, (e >> self.DIR_BITS).long(), (e & ((1 << self.DIR_BITS) - 1)).float(),
+                  dq[lo:hi][rep], idf[lo:hi][rep], k_center)
+            lo = hi
+        return top_votes(votes, self.n_points, k, per_place=True)
+
+    def _tiles(self, a, n, dq, idf, tile):
+        """Découpe chaque mot en segments par tuile de `tile` lieux, rangés tuile par tuile : les votes d'une
+        tuile restent dans le cache L2. Dans un mot, les entrées sont rangées par lieu (dichotomie)."""
+        dev = self.device
+        n_tiles = (self.n_points + tile - 1) // tile
+        bounds = torch.arange(n_tiles + 1, device=dev, dtype=torch.int64) * tile << self.DIR_BITS
+        lo = a[:, None].expand(-1, n_tiles + 1).clone()
+        hi = (a + n)[:, None].expand(-1, n_tiles + 1).clone()
+        for _ in range(int(n.max()).bit_length() + 1):        # premier rang dont le lieu atteint la limite
+            mid = (lo + hi) // 2
+            below = (self.packed[mid.clamp(max=len(self.packed) - 1)].long() < bounds[None]) & (lo < hi)
+            lo = torch.where(below, mid + 1, lo)
+            hi = torch.where(below | (lo >= hi), hi, mid)
+        seg_a = lo[:, :-1].T.reshape(-1)
+        seg_n = (lo[:, 1:] - lo[:, :-1]).T.reshape(-1)
+        slot = torch.arange(len(n), device=dev).repeat(n_tiles)
+        keep = seg_n > 0
+        return seg_a[keep], seg_n[keep], dq[slot[keep]], idf[slot[keep]]
 
 
 class ShardedIndex:
@@ -170,11 +315,33 @@ class ShardedIndex:
             s.idf = idf
         self.starts = np.cumsum([0] + [s.n_points for s in self.shards])
 
+    def gpu_bytes(self):
+        return sum(GpuIndex.bytes_needed(s) for s in self.shards)
+
+    def to_gpu(self, device="cuda", reserve=0.0):
+        """Copie les morceaux sur GPU (GpuIndex) un par un, tant qu'il reste `reserve` octets libres après ;
+        les autres restent en mémoire centrale. Mêmes lieux proposés. Renvoie le nombre de morceaux sur GPU."""
+        self.gpu = []
+        for s in self.shards:
+            fits = torch.cuda.mem_get_info(torch.device(device))[0] - reserve > GpuIndex.bytes_needed(s)
+            self.gpu.append(GpuIndex(s, device=device) if fits else None)
+        on_gpu = [g for g in self.gpu if g is not None]
+        if on_gpu:                                            # un seul tableau de votes pour tous les morceaux
+            votes = torch.empty(max(g.n_points for g in on_gpu) * int(round(360 / HEADING_BIN)), device=device)
+            for g in on_gpu:
+                g.votes = votes
+        return len(on_gpu)
+
     def query(self, P, M, k_center, n_places=1000, device="cuda"):
         """Renvoie jusqu'à n_places lieux distincts (indices globaux), du plus voté au moins voté."""
         pts, votes = [], []
-        for start, s in zip(self.starts, self.shards):
-            p, _, v = s.query(P, M, k_center, k=20 * n_places, device=device)
+        gpu = getattr(self, "gpu", None) or [None] * len(self.shards)
+        queries = query_words(P, M) if any(g is not None for g in gpu) else None
+        for i, (start, s) in enumerate(zip(self.starts, self.shards)):
+            if gpu[i] is not None:
+                p, _, v = gpu[i].query(queries, k_center, k=n_places)       # déjà des lieux distincts
+            else:
+                p, _, v = s.query(P, M, k_center, k=20 * n_places, device=device)
             pts.append(p + start)
             votes.append(v)
         pts, votes = np.concatenate(pts), np.concatenate(votes)

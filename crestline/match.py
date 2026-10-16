@@ -99,8 +99,9 @@ class Query:
         self.FMP = torch.fft.rfft(Pc).conj()
 
     @torch.no_grad()
-    def score(self, B, B2):
-        """B, B2 : profile_ffts. Renvoie écart rms (deg), décalage (cases), indice de tangage."""
+    def score(self, B, B2, shift_center=None, shift_tol=0):
+        """B, B2 : profile_ffts. Renvoie écart rms (deg), décalage (cases), indice de tangage.
+        shift_center (B,) : si donné, seuls les décalages à moins de shift_tol cases de celui-ci sont testés."""
         rms = torch.full((len(B),), float("inf"), device=B.device)
         sh = torch.zeros(len(B), dtype=torch.long, device=B.device)
         pi = torch.zeros_like(sh)
@@ -111,11 +112,17 @@ class Query:
         base = torch.fft.irfft(self.FM * B2, n=n_az) - s_b * s_b / n   # Σ m b² - (Σ m b)²/n
         s_xb = torch.fft.irfft(self.FX * B, n=n_az)
         del s_b
+        banned = None
+        if shift_center is not None:
+            dk = (torch.arange(n_az, device=B.device)[None] - shift_center.to(B.device)[:, None] + n_az // 2) % n_az
+            banned = (dk - n_az // 2).abs() > shift_tol
         for j in self.pitch_idx:
             sse = base - 2 * torch.fft.irfft(self.FMP[j] * B, n=n_az) + self.S_pp[j]
             s_xr = self.S_xp[j] - s_xb                                 # pente du résidu (roulis), bornée
             g = (s_xr / self.S_xx).clamp(-self.g_max, self.g_max)
             sse = sse - 2 * g * s_xr + g * g * self.S_xx
+            if banned is not None:
+                sse = sse.masked_fill(banned, float("inf"))
             v, s = sse.min(1)
             v = (v.clamp(min=0) / n).sqrt()
             better = v < rms
@@ -124,23 +131,36 @@ class Query:
 
 
 def score_all(query_args, shards, chunk=100_000):
-    """Recherche exhaustive. shards : horizons de la carte en float16, un tenseur par GPU ; calcul en parallèle."""
-    queries = [Query(*query_args, e.device) for e in shards]
-    out = [[] for _ in shards]
-    for i in range(0, max(len(e) for e in shards), chunk):             # paquets entrelacés entre GPU
-        for q, e, o in zip(queries, shards, out):
+    """Recherche exhaustive. shards : horizons de la carte (float16), dans l'ordre des points ; chaque morceau est
+    soit un tenseur déjà sur un GPU, soit un couple (tableau en mémoire centrale, device) lu en flux par paquets
+    (plus lent, quand la carte ne tient pas sur les GPU). Les GPU calculent en parallèle."""
+    parts = [(e, e.device) if torch.is_tensor(e) else e for e in shards]
+    queries = {}
+    for _, dev in parts:
+        queries.setdefault(str(dev), Query(*query_args, dev))
+    out = [[] for _ in parts]
+    for i in range(0, max(len(e) for e, _ in parts), chunk):           # paquets entrelacés entre morceaux
+        for (e, dev), o in zip(parts, out):
             if i < len(e):
-                o.append(q.score(*profile_ffts(e[i:i + chunk])))
+                block = e[i:i + chunk]
+                if not torch.is_tensor(block):
+                    block = torch.from_numpy(np.ascontiguousarray(block)).to(dev, non_blocking=True)
+                o.append(queries[str(dev)].score(*profile_ffts(block)))
     res = [tuple(torch.cat(t) for t in zip(*o)) for o in out]
     return tuple(np.concatenate([r[k].cpu().numpy() for r in res]) for k in range(3))
 
 
 @torch.no_grad()
-def refine(dem, query, centers, cam_h=CAM_HEIGHT, radius=100.0, step=25.0):
+def refine(dem, query, centers, cam_h=CAM_HEIGHT, radius=100.0, step=25.0, shifts=None, width=None, tol_deg=15.0):
     """Horizons recalculés sur une grille fine autour de chaque candidat : le relief proche change vite.
 
         candidat (grille 125 m)          raffinement ±100 m, pas 25 m
                ●                          · · · · ● · · · ·   → meilleur point
+
+    shifts (K,) : décalage (cap) déjà trouvé pour chaque candidat ; width : cases couvertes par la photo.
+    Si donnés, l'horizon n'est calculé que dans la fenêtre de la photo (± tol_deg) et le cap n'est cherché
+    qu'à ± tol_deg : 3 à 5 fois moins de rayons qu'un tour complet. Se déplacer de 100 m ne change le cap
+    que de quelques degrés ; hors de la fenêtre, une valeur fixe (le score ignore un décalage vertical).
 
     Renvoie, par candidat : meilleure position (K, 2), écart, décalage, tangage."""
     off = np.arange(-radius, radius + 1e-6, step)
@@ -149,11 +169,23 @@ def refine(dem, query, centers, cam_h=CAM_HEIGHT, radius=100.0, step=25.0):
     x = torch.tensor(pos[:, 0], dtype=torch.float32, device=dem.device)
     y = torch.tensor(pos[:, 1], dtype=torch.float32, device=dem.device)
     ground = dem.sample(0, x, y)
+    n_az = query.n_az
+    windowed = shifts is not None and width is not None
+    if windowed:
+        tol = int(math.ceil(tol_deg * n_az / 360))
+        sc = torch.as_tensor(np.repeat(np.asarray(shifts), len(off) ** 2), device=dem.device).long()
+        bins = (sc[:, None] - tol + torch.arange(width + 2 * tol, device=dem.device)[None]) % n_az
     out = []
     for i in range(0, len(pos), 4096):
         sl = slice(i, i + 4096)
-        elev, _ = horizon(dem, x[sl], y[sl], ground[sl] + cam_h, query.n_az)
-        out.append(query.score(*profile_ffts(torch.nan_to_num(elev, nan=-15.0).to(query.FM.device))))
+        if windowed:
+            part, _ = horizon(dem, x[sl], y[sl], ground[sl] + cam_h, n_az, az_bins=bins[sl])
+            elev = torch.full((len(part), n_az), -15.0, device=dem.device)
+            elev.scatter_(1, bins[sl], torch.nan_to_num(part, nan=-15.0))
+            out.append(query.score(*profile_ffts(elev.to(query.FM.device)), sc[sl].to(query.FM.device), tol))
+        else:
+            elev, _ = horizon(dem, x[sl], y[sl], ground[sl] + cam_h, n_az)
+            out.append(query.score(*profile_ffts(torch.nan_to_num(elev, nan=-15.0).to(query.FM.device))))
     rms, sh, pi = (torch.cat(o).cpu().numpy().reshape(len(centers), -1) for o in zip(*out))
     rms = np.where(np.isfinite(ground.cpu().numpy().reshape(len(centers), -1)), rms, np.inf)
     j = rms.argmin(1)

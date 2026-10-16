@@ -15,6 +15,7 @@ import math
 import numpy as np
 import torch
 
+from . import kernels
 from .dem import MAX_DIST, drop, level_for
 
 CAM_HEIGHT = 1.7
@@ -29,12 +30,19 @@ def distance_steps(t0=15.0, rel=0.006, abs_step=6.0):
 
 
 @torch.no_grad()
-def horizon(dem, x, y, h, n_az=1440):
-    """x, y, h : tenseurs (B,) positions et altitudes caméra. Renvoie élévation (deg) et distance (m), (B, n_az)."""
+def horizon(dem, x, y, h, n_az=1440, az_bins=None):
+    """x, y, h : tenseurs (B,) positions (de préférence en float64) et altitudes caméra.
+    Renvoie élévation (deg) et distance (m), (B, n_az).
+    az_bins : (B, A) cases d'azimut à calculer pour chaque point (sinon les n_az) ; la sortie est alors (B, A)."""
     dev = dem.device
-    az = torch.arange(n_az, device=dev) * (2 * math.pi / n_az)
+    if az_bins is None:
+        az_bins = torch.arange(n_az, device=dev)[None]
+    az = az_bins.to(dev).float() * (2 * math.pi / n_az)
+    if kernels.available(dev):                                 # un seul noyau GPU : ~8x plus rapide, plus précis
+        return kernels.horizon_march(dem, x, y, h, az, distance_steps, level_for, drop)
+    x, y = x.float(), y.float()
     ux, uy = torch.sin(az), torch.cos(az)
-    best = torch.full((len(x), n_az), -90.0, device=dev)
+    best = torch.full((len(x), az.shape[1]), -90.0, device=dev)
     best_t = torch.zeros_like(best)
     x, y, h = x[:, None], y[:, None], h[:, None]
     for t in distance_steps():
