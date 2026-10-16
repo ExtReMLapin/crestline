@@ -72,12 +72,20 @@ class Dem:
 
 
 @torch.no_grad()
-def horizon(dem, e, n, h, n_az=1440):
-    """e, n, h : (B,) positions et altitudes caméra. Renvoie élévation (deg) et distance (m) de l'horizon, (B, n_az)."""
+def horizon(dem, e, n, h, n_az=1440, az_bins=None):
+    """e, n, h : (B,) positions et altitudes caméra. Renvoie élévation (deg) et distance (m) de l'horizon, (B, n_az).
+    az_bins : (B, A) cases d'azimut à calculer pour chaque point (sinon les n_az) ; la sortie est alors (B, A)."""
     dev = dem.device
-    az = torch.arange(n_az, device=dev) * (2 * math.pi / n_az)
+    if az_bins is None:
+        az_bins = torch.arange(n_az, device=dev)[None]
+    az = az_bins.to(dev).float() * (2 * math.pi / n_az)
+    if str(dev).startswith("cuda") and os.environ.get("HORIZON_TORCH") != "1":
+        from horizon_fused import horizon_fused        # un seul noyau GPU, ~8x plus rapide et plus précis
+        best, best_t = horizon_fused(dem, e, n, h, az, distance_steps, LEVEL_MAX_T, (1 - K_REFRACTION) / (2 * R_EARTH))
+        return best, best_t
     ue, un = torch.sin(az), torch.cos(az)
-    best = torch.full((len(e), n_az), -90.0, device=dev)
+    e, n = e.float(), n.float()
+    best = torch.full((len(e), az.shape[1]), -90.0, device=dev)
     best_t = torch.zeros_like(best)
     drop = (1 - K_REFRACTION) / (2 * R_EARTH)
     e, n, h = e[:, None], n[:, None], h[:, None]

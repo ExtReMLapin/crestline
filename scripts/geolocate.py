@@ -8,6 +8,7 @@ Baseline sans apprentissage :
 - tout est calculé par corrélation circulaire FFT sur GPU, pour tous les caps à la fois.
 """
 import math
+import os
 
 import numpy as np
 import torch
@@ -145,8 +146,9 @@ class Query:
         self.FMP = torch.fft.rfft(Pc).conj()
 
     @torch.no_grad()
-    def score(self, B, B2):
-        """B, B2 : profile_ffts. Renvoie rms (deg), décalage (cases), indice de tangage."""
+    def score(self, B, B2, shift_center=None, shift_tol=0):
+        """B, B2 : profile_ffts. Renvoie rms (deg), décalage (cases), indice de tangage.
+        shift_center (B,) : si donné, seuls les décalages à moins de shift_tol cases de celui-ci sont testés."""
         rms = torch.full((len(B),), float("inf"), device=B.device)
         sh = torch.zeros(len(B), dtype=torch.long, device=B.device)
         pi = torch.zeros_like(sh)
@@ -157,6 +159,11 @@ class Query:
         base = torch.fft.irfft(self.FM * B2, n=n_az) - s_b * s_b / n   # Σ m b² - (Σ m b)²/n
         s_xb = torch.fft.irfft(self.FX * B, n=n_az)
         del s_b
+        banned = None
+        if shift_center is not None:
+            k = torch.arange(n_az, device=B.device)
+            dk = (k[None] - shift_center.to(B.device)[:, None] + n_az // 2) % n_az - n_az // 2
+            banned = dk.abs() > shift_tol
         for j in self.pitch_idx:
             s_pb = torch.fft.irfft(self.FMP[j] * B, n=n_az)
             sse = base - 2 * s_pb + self.S_pp[j]                        # Σ m (P - b - c*)², somme(Pc) = 0
@@ -164,6 +171,8 @@ class Query:
             s_xr = self.S_xp[j] - s_xb
             g = (s_xr / self.S_xx).clamp(-self.g_max, self.g_max)
             sse = sse - 2 * g * s_xr + g * g * self.S_xx
+            if banned is not None:
+                sse = sse.masked_fill(banned, float("inf"))
             v, s = sse.min(1)
             v = (v.clamp(min=0) / n).sqrt()
             better = v < rms
@@ -182,20 +191,37 @@ class Refiner:
         self.radius, self.step = radius, step
 
     @torch.no_grad()
-    def refine(self, query, centers, n_az=1440):
-        """centers : (K, 2) E/N. Renvoie, par candidat, meilleure position (K, 2), rms, décalage, tangage."""
+    def refine(self, query, centers, n_az=1440, shifts=None, width=None, tol_deg=15.0):
+        """centers : (K, 2) E/N. Renvoie, par candidat, meilleure position (K, 2), rms, décalage, tangage.
+
+        shifts (K,) : décalage (cap) déjà trouvé pour chaque candidat ; width : cases couvertes par la photo.
+        Si donnés, l'horizon n'est calculé que dans la fenêtre de la photo (± tol_deg) et le cap n'est
+        cherché qu'à ± tol_deg : 3 à 5 fois moins de rayons qu'un tour complet."""
         from horizon_db import CAM_HEIGHT, horizon
         off = np.arange(-self.radius, self.radius + 1e-6, self.step)
         oe, on = np.meshgrid(off, off)
+        per = len(off) ** 2
         pos = (centers[:, None, :] + np.stack([oe.ravel(), on.ravel()], 1)[None]).reshape(-1, 2)
         e = torch.tensor(pos[:, 0], dtype=torch.float32, device=self.device)
         n = torch.tensor(pos[:, 1], dtype=torch.float32, device=self.device)
         ground = self.dem.ground(e[None], n[None])[0]
+        windowed = shifts is not None and width is not None and os.environ.get("REFINE_FULL") != "1"
+        tol_deg = float(os.environ.get("REFINE_TOL", tol_deg))
+        if windowed:
+            tol = int(math.ceil(tol_deg * n_az / 360))
+            sc = torch.as_tensor(np.repeat(np.asarray(shifts), per), device=self.device).long()
+            bins = (sc[:, None] - tol + torch.arange(width + 2 * tol, device=self.device)[None]) % n_az
         out = []
         for i in range(0, len(pos), 4096):
             sl = slice(i, i + 4096)
-            elev, _ = horizon(self.dem, e[sl], n[sl], ground[sl] + CAM_HEIGHT, n_az)
-            out.append(query.score(*profile_ffts(torch.nan_to_num(elev, nan=-15.0).to(query.FM.device))))
+            if windowed:
+                part, _ = horizon(self.dem, e[sl], n[sl], ground[sl] + CAM_HEIGHT, n_az, az_bins=bins[sl])
+                elev = torch.full((len(part), n_az), -15.0, device=self.device)
+                elev.scatter_(1, bins[sl], torch.nan_to_num(part, nan=-15.0))
+                out.append(query.score(*profile_ffts(elev.to(query.FM.device)), sc[sl], tol))
+            else:
+                elev, _ = horizon(self.dem, e[sl], n[sl], ground[sl] + CAM_HEIGHT, n_az)
+                out.append(query.score(*profile_ffts(torch.nan_to_num(elev, nan=-15.0).to(query.FM.device))))
         rms, sh, pi = (torch.cat(o).cpu().numpy().reshape(len(centers), -1) for o in zip(*out))
         rms = np.where(np.isfinite(ground.cpu().numpy().reshape(len(centers), -1)), rms, np.inf)
         j = rms.argmin(1)
@@ -234,12 +260,12 @@ def localize(matcher, refiner, sky, focal, n_refine=100, k=20, truth=None):
     if refiner is not None and n_refine:
         cand = top_candidates(matcher.points, rms, n_refine, radius=500.0)
         centers = pos[cand]
+        q = Query(P, M)
+        cols = np.nonzero(M.max(0))[0]
+        width = int(cols.max()) + 1 if len(cols) else None      # cases couvertes par la photo (None : tour complet)
+        pos, rms, shift, pitch = refiner.refine(q, centers, shifts=shift[cand], width=width)
         if truth is not None:
-            centers = np.vstack([centers, [truth]])
-        pos, rms, shift, pitch = refiner.refine(Query(P, M), centers)
-        if truth is not None:
-            diag["true_rms"] = float(rms[-1])
-            pos, rms, shift, pitch = pos[:-1], rms[:-1], shift[:-1], pitch[:-1]
+            diag["true_rms"] = float(refiner.refine(q, np.asarray([truth], float))[1][0])
     elif truth is not None:
         diag["true_rms"] = diag["true_rms_grid"]
     delta = 360.0 / matcher.n_az
@@ -270,12 +296,11 @@ def localize_indexed(index, elev, points, refiner, sky, focal, n_places=1000, n_
         diag["in_shortlist"] = bool(d.min() < 1000)
     cand = top_candidates(pos, rms, n_refine, radius=500.0)
     centers = pos[cand]
+    cols = np.nonzero(M.max(0))[0]
+    width = int(cols.max()) + 1 if len(cols) else None          # cases couvertes par la photo (None : tour complet)
+    pos, rms, shift, pitch = refiner.refine(q, centers, shifts=shift[cand], width=width)
     if truth is not None:
-        centers = np.vstack([centers, [truth]])
-    pos, rms, shift, pitch = refiner.refine(q, centers)
-    if truth is not None:
-        diag["true_rms"] = float(rms[-1])
-        pos, rms, shift, pitch = pos[:-1], rms[:-1], shift[:-1], pitch[:-1]
+        diag["true_rms"] = float(refiner.refine(q, np.asarray([truth], float))[1][0])
     delta = 360.0 / elev.shape[1]
     best = top_candidates(pos, rms, k)
     return [{"e": float(pos[i, 0]), "n": float(pos[i, 1]), "rms": float(rms[i]),
