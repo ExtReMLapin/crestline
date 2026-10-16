@@ -1,7 +1,13 @@
 """Évaluation rapide (index de mots de crête) sur CH1 ou une liste smapshot, pour plusieurs réglages du
 filtre de colonnes fiables à la fois (la segmentation n'est calculée qu'une fois par photo).
 
-Usage : python scripts/eval_geoloc_fast.py <ch1|liste_smapshot> <sortie> <conf:netteté,...> [n_photos]
+Usage : python scripts/eval_geoloc_fast.py <ch1|crosslocate|liste_smapshot> <sortie> <conf:netteté,...> [n_photos]
+
+crosslocate : test du jeu « Uniform » de CrossLocate (3 513 photos en Suisse), voir scripts/crosslocate_meta.py.
+
+En parallèle sur plusieurs GPU : SHARD=i/N (photo n° k traitée si k % N == i), rapport dans <sortie>/shard_i,
+puis fusion : python scripts/eval_geoloc_fast.py merge <sortie>
+Progression : <sortie>/shard_i/progress.json (photos faites, total).
 
 Exemple : ... data/smapshot/lists/val.txt outputs/x 0:0,0.5:0.8,0.6:0.9 200
 """
@@ -52,19 +58,84 @@ def smapshot_samples(id_list, photo_dir="data/smapshot/out/photos"):
         yield i, image, p["focal"] * image.shape[1] / cams[i]["width"], e, n, heading
 
 
+def crosslocate_samples(meta="data/crosslocate/test_queries.json", photo_dir="data/crosslocate/query_photos"):
+    """Le cap de CrossLocate (yaw, radians) suit sa propre convention : il est rangé tel quel dans le rapport
+    (champ cl_yaw) et comparé après coup. Focale tirée du champ de vision horizontal fourni."""
+    for q in json.load(open(meta)):
+        path = Path(photo_dir) / q["fn"]
+        if not path.exists():
+            continue
+        im = Image.open(path).convert("RGB")
+        im.thumbnail((1536, 1536), Image.LANCZOS)      # comme crestline.model.prepare (originaux jusqu'à 7 360 px)
+        image = np.asarray(im)
+        e, n = TO_LV95.transform(q["lon"], q["lat"])
+        focal = image.shape[1] / 2 / np.tan(q["hfov"] / 2)
+        yield q["fn"], image, focal, e, n, {"cl_yaw": q["yaw"]}
+
+
+def prefetch(gen, depth=4):
+    """Décode les photos suivantes dans un fil à part pendant que le GPU travaille."""
+    import queue
+    import threading
+    q, end = queue.Queue(depth), object()
+
+    def work():
+        for x in gen:
+            q.put(x)
+        q.put(end)
+    threading.Thread(target=work, daemon=True).start()
+    while (x := q.get()) is not end:
+        yield x
+
+
+def summarize(res):
+    """res : {réglage : [résultat par photo]} -> taux de réussite à 1 km (top 1, 5, 20) et temps médian."""
+    summary = {}
+    for s, rs in res.items():
+        first = [r["first_hit"] for r in rs]
+        summary[s] = {"n": len(rs), **{f"recall@{k}": float(np.mean([f is not None and f <= k for f in first]))
+                                      for k in (1, 5, 20)},
+                      "median_seconds": float(np.median([r["seconds"] for r in rs]))}
+    return summary
+
+
+def merge(out_dir):
+    """Fusionne les rapports des morceaux <out_dir>/shard_*/report.json."""
+    out_dir = Path(out_dir)
+    res = {}
+    for f in sorted(out_dir.glob("shard_*/report.json")):
+        for s, rs in json.load(open(f))["images"].items():
+            res.setdefault(s, []).extend(rs)
+    summary = summarize(res)
+    print(json.dumps(summary, indent=2))
+    json.dump({"summary": summary, "images": res}, open(out_dir / "report.json", "w"), indent=1)
+
+
 def main(dataset, out_dir, settings, n_photos=None):
     out_dir = Path(out_dir)
+    shard, n_shards = (int(x) for x in os.environ.get("SHARD", "0/1").split("/"))
+    if n_shards > 1:
+        out_dir = out_dir / f"shard_{shard}"
     out_dir.mkdir(parents=True, exist_ok=True)
     settings = [tuple(float(x) for x in s.split(":")) for s in settings.split(",")]
     points, elev = load_many(DBS)
     index = ShardedIndex(INDEXES)
+    if os.environ.get("GEOLOC_GPU_INDEX", "1") == "1":   # index sur GPU (4,6 Go), mêmes résultats, ~3,5x plus rapide
+        index.to_gpu("cuda")
     refiner = Refiner((*points[:, :2].min(0), *points[:, :2].max(0)))
     model = load_trained(CKPT, "cuda")
-    samples = ch1_samples() if dataset == "ch1" else smapshot_samples(dataset)
+    samples = (ch1_samples() if dataset == "ch1" else crosslocate_samples() if dataset == "crosslocate"
+               else smapshot_samples(dataset))
     res = {s: [] for s in settings}
-    for count, (name, image, focal, e, n, heading) in enumerate(samples):
+    total = {"ch1": 203, "crosslocate": 3513}.get(dataset) or len(Path(dataset).read_text().split())
+    total = (total - shard + n_shards - 1) // n_shards
+    samples = (x for k, x in enumerate(samples) if k % n_shards == shard)
+    done = 0
+    for count, (name, image, focal, e, n, heading) in enumerate(prefetch(samples)):
         if n_photos and count >= int(n_photos):
             break
+        done += 1
+        (out_dir / "progress.json").write_text(json.dumps({"dataset": dataset, "done": done, "total": total}))
         prob = predict(model, image, "cuda")
         rows = skyline_rows(prob[0] > 0.5)
         line = []
@@ -75,21 +146,23 @@ def main(dataset, out_dir, settings, n_photos=None):
             d = [np.hypot(c["e"] - e, c["n"] - n) for c in cands] or [np.inf]
             hit = next((k + 1 for k, x in enumerate(d) if x < 1000), None)
             r = {"id": name, "top1_m": float(d[0]), "first_hit": hit, "seconds": time.time() - t, **diag}
-            if heading is not None and cands:
+            if isinstance(heading, dict):
+                r.update(heading)
+                if cands:
+                    r["heading_grid"] = cands[0]["heading_grid"]
+            elif heading is not None and cands:
                 r["heading_err"] = float(abs((cands[0]["heading_grid"] - heading + 180) % 360 - 180))
             res[s].append(r)
             line.append(f"{s}:{hit}")
         print(name, " ".join(line), flush=True)
-    summary = {}
-    for s, rs in res.items():
-        first = [r["first_hit"] for r in rs]
-        summary[":".join(f"{x:g}" for x in s)] = {"n": len(rs), **{f"recall@{k}": float(np.mean([f is not None and f <= k for f in first]))
-                                                     for k in (1, 5, 20)},
-                                     "median_seconds": float(np.median([r["seconds"] for r in rs]))}
+    res = {":".join(f"{x:g}" for x in s): rs for s, rs in res.items()}
+    summary = summarize(res)
     print(json.dumps(summary, indent=2))
-    json.dump({"summary": summary, "images": {":".join(f"{x:g}" for x in s): rs for s, rs in res.items()}},
-              open(out_dir / "report.json", "w"), indent=1)
+    json.dump({"summary": summary, "images": res}, open(out_dir / "report.json", "w"), indent=1)
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    if sys.argv[1] == "merge":
+        merge(sys.argv[2])
+    else:
+        main(*sys.argv[1:])

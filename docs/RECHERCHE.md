@@ -55,10 +55,33 @@ uv run python scripts/eval_ch1.py data/ch1/extracted outputs/eval_ch1 outputs/<r
 uv run python scripts/predict_photos.py outputs/<run>/best.pt photos outputs/<run>/fiz_2048 2048
 ```
 
+## Géolocalisation : évaluations
+
+Base d'horizons suisse (`data/horizon/ch125_band*`) et index (`data/horizon/index125_band*`) : voir
+[PHASE2_geolocalisation.md](PHASE2_geolocalisation.md).
+
+```bash
+# test « Uniform » de CrossLocate (Tomešek et al., WACV 2022) : métadonnées + photos de test seulement (~4 Go)
+B=https://cphoto.fit.vutbr.cz/crosslocate/dataset
+curl -O $B/meta_structures/uniform_dataset/Alps_photos_to_depth_compact_test.npy
+uv run python -I scripts/crosslocate_meta.py Alps_photos_to_depth_compact_test.npy data/crosslocate/test_queries.json
+# (extraire de query_photos.tar.gz les seules photos listées dans test_queries.json, en flux : tar -T)
+# aucune photo de test ne doit figurer dans l'entraînement de Crestline (verdict final à l'œil)
+uv run python scripts/overlap_check.py data/crosslocate/query_photos data/smapshot/lists_all/train.txt
+
+# tout : mode index (une photo sur trois par GPU, 3 GPU en parallèle) puis mode brute, ~35 min
+scripts/validate_all.sh v3
+```
+
 ## Scripts
 
 | Script | Rôle |
 |---|---|
+| `geolocate.py`, `horizon_db.py`, `ridge_index.py` | géolocalisation : profils, matching FFT, raffinement, base d'horizons, index |
+| `horizon_fused.py` | lancer de rayons en un seul noyau GPU (Triton) |
+| `eval_geoloc_ch1.py`, `eval_geoloc_smapshot.py` | évaluations en mode brute (3 GPU) |
+| `eval_geoloc_fast.py`, `eval_all_parallel.sh`, `validate_all.sh` | évaluations en mode index (CH1, smapshot, CrossLocate), en parallèle |
+| `crosslocate_meta.py`, `overlap_check.py` | test CrossLocate : métadonnées (lecture sûre du pickle), recouvrement avec l'entraînement |
 | `dem_render.py` | rendu GPU de cartes de distance depuis le MNT suisse (courbure, réfraction, 3 niveaux) |
 | `smapshot.py` | API smapshot, modèle de caméra (vérifié au pixel), téléchargement IIIF / Deep Zoom |
 | `smapshot_labels.py` | étiquettes ciel / skyline / crêtes + masques à ignorer, affinage d'orientation |
